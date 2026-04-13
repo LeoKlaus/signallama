@@ -67,3 +67,34 @@ python signallama.py
 ```
 
 The bot will listen for messages through Signal and respond using your configured LLM.
+
+
+## Docker Setup
+
+Alternatively, you can run the bot as a container. The easiest way is to use Docker compose:
+
+``` yaml
+services:
+   signallama:
+      build: /path/to/repo/signallama-docker
+      pull_policy: build
+      volumes:
+         - "/path/to/settings.py:/signallama/settings.py"
+```
+
+Here's an example including the signal-cli-rest-api container:
+
+``` yaml
+services:
+  signal-cli:
+    image: bbernhard/signal-cli-rest-api:latest
+    environment:
+      - MODE=native #supported modes: json-rpc, native, normal
+    volumes:
+      - "/path/to/signal-cli-config:/home/.local/share/signal-cli"
+  signallama:
+    build: /path/to/repo/signallama-docker
+    pull_policy: build
+    volumes:
+      - "/path/to/settings.py:/signallama/settings.py"
+```
