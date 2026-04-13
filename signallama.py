@@ -135,6 +135,7 @@ class SignalLLMBridge:
         self.context = context_mgr
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = True
+        self.typing_to = None
         
         # Configure LiteLLM settings
         if llm_cfg.api_base:
@@ -243,7 +244,9 @@ class SignalLLMBridge:
                         continue
                         
                     logger.info("Received from %s: %s", author, body)
+                    await self._start_typing(author)
                     reply = await self._get_ai_response(body, author)
+                    await self._stop_typing(author)
                     await self._send_reply(author, reply)
 
                 except Exception as e:
@@ -387,6 +390,45 @@ class SignalLLMBridge:
         
         return False
 
+
+    async def _typing_loop(self):
+        while self.typing_to is not None:
+            await self._send_typing_indicator(self.typing_to)
+            await asyncio.sleep(10)
+
+    async def _start_typing(self, recipient: str):
+        self.typing_to = recipient
+        asyncio.create_task(self._typing_loop())
+
+    async def _send_typing_indicator(self, recipient: str) -> None:
+        """Send a typing indicator"""
+        send_url = f"{self.signal_cfg.api_url}/v1/typing-indicator/{self.signal_cfg.number}"
+        payload = {
+            'recipient': recipient
+        }
+        
+        try:
+            await self.session.put(send_url, json=payload)
+            logger.info("Sent typing indicator to %s", recipient)
+        except Exception as e:
+            logger.error("Error sending to %s: %s", recipient, e)
+
+    async def _stop_typing(self, recipient: str) -> None:
+        """Stop the typing indicator"""
+
+        self.typing_to = None
+
+        send_url = f"{self.signal_cfg.api_url}/v1/typing-indicator/{self.signal_cfg.number}"
+        payload = {
+            'recipient': recipient
+        }
+        
+        try:
+            await self.session.delete(send_url, json=payload)
+            logger.info("Removed typing indicator to %s", recipient)
+        except Exception as e:
+            logger.error("Error sending to %s: %s", recipient, e)
+
     async def _send_reply(self, recipient: str, message: str) -> None:
         """Send a reply message"""
         send_url = f"{self.signal_cfg.api_url}/v2/send"
@@ -394,7 +436,7 @@ class SignalLLMBridge:
             'number': self.signal_cfg.number,
             'recipients': [recipient],
             'message': message,
-            'text_mode': 'normal'
+            'text_mode': 'styled'
         }
         
         try:
