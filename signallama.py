@@ -35,9 +35,11 @@ MAX_HISTORY = 10  # number of turns to keep per user
 def filter_think_tags(text: str) -> str:
     """Remove content between <think></think> tags from text"""
     # Remove <think>...</think> blocks (case insensitive, multiline)
-    filtered = re.sub(r'<think>.*?</think>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    filtered = re.sub(r'<think>.*?</think>', '', text,
+                      flags=re.IGNORECASE | re.DOTALL)
     # Clean up extra whitespace
-    filtered = re.sub(r'\n\s*\n\s*\n', '\n\n', filtered)  # Multiple newlines to double
+    # Multiple newlines to double
+    filtered = re.sub(r'\n\s*\n\s*\n', '\n\n', filtered)
     return filtered.strip()
 
 
@@ -136,7 +138,9 @@ class SignalLLMBridge:
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = True
         self.typing_to = None
-        
+        # Dict mapping internal group id to actual id
+        self.groups = {}
+
         # Configure LiteLLM settings
         if llm_cfg.api_base:
             litellm.api_base = llm_cfg.api_base
@@ -149,22 +153,59 @@ class SignalLLMBridge:
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(py_signal.SIGINT, self._stop)
         loop.add_signal_handler(py_signal.SIGTERM, self._stop)
-        logger.info("Bridge started using REST polling mode with model: %s (Whisper: %s)", 
-                   self.llm_cfg.model, 
-                   "enabled" if self.whisper_cfg.enabled else "disabled")
+        logger.info("Bridge started using REST polling mode with model: %s (Whisper: %s)",
+                    self.llm_cfg.model,
+                    "enabled" if self.whisper_cfg.enabled else "disabled")
+        await self._get_groups()
         await self._poll_loop()
+
+    async def _get_groups(self) -> None:
+        group_url = f"{self.signal_cfg.api_url}/v1/groups/{self.signal_cfg.number}"
+        try:
+            async with self.session.get(group_url) as resp:
+                resp.raise_for_status()
+                text = await resp.text()
+
+                # Parse response - it's a JSON array
+                if not text.strip():
+                    return
+
+                logger.debug(
+                    "Raw response from signal API: %s", text[:500])
+
+                try:
+                    # Response is a JSON array of groups
+                    groups = json.loads(text)
+                    if not isinstance(groups, list):
+                        groups = [groups]  # Handle single message case
+                    logger.debug(
+                        "Parsed %d groups from API", len(groups))
+                except json.JSONDecodeError as e:
+                    logger.error("Failed to parse JSON response: %s", e)
+                    logger.debug("Problematic response: %s", text[:200])
+                    return
+
+        except Exception as e:
+            logger.error("Error receiving messages: %s", e)
+            return
+
+        for group in groups:
+            internal_id = group.get('internal_id')
+            group_id = group.get('id')
+            if internal_id and group_id:
+                self.groups[internal_id] = group_id
 
     async def _poll_loop(self) -> None:
         # Don't URL encode the number - signal-cli-rest-api expects raw number
         receive_url = f"{self.signal_cfg.api_url}/v1/receive/{self.signal_cfg.number}"
-        send_url = f"{self.signal_cfg.api_url}/v2/send"
-        
+
         while self.running:
             try:
                 params = {
                     "timeout": self.signal_cfg.receive_timeout,
                     "ignore_attachments": "false",
-                    "ignore_stories": "true"
+                    "ignore_stories": "true",
+                    "send_read_receipts": "true"
                 }
                 async with self.session.get(receive_url, params=params) as resp:
                     resp.raise_for_status()
@@ -174,9 +215,9 @@ class SignalLLMBridge:
                     if not text.strip():
                         await asyncio.sleep(self.signal_cfg.poll_interval)
                         continue
-                    
+
                     logger.debug("Raw response from signal API: %s", text[:500])
-                        
+                    
                     try:
                         # Response is a JSON array of messages
                         messages = json.loads(text)
@@ -188,7 +229,7 @@ class SignalLLMBridge:
                         logger.debug("Problematic response: %s", text[:200])
                         await asyncio.sleep(self.signal_cfg.poll_interval)
                         continue
-                                
+
             except Exception as e:
                 logger.error("Error receiving messages: %s", e)
                 await asyncio.sleep(self.signal_cfg.poll_interval)
@@ -200,33 +241,77 @@ class SignalLLMBridge:
                     if not isinstance(msg, dict):
                         logger.debug("Skipping non-dict message: %s", type(msg).__name__)
                         continue
-                    
+
                     # Extract envelope
                     envelope = msg.get('envelope', {})
                     if not envelope:
                         logger.debug("No envelope found, skipping message")
                         continue
-                    
+
                     # Only process messages with actual content (dataMessage)
                     data_message = envelope.get('dataMessage')
                     if not data_message:
                         # Skip typing indicators and other non-content messages
-                        msg_type = 'typing' if envelope.get('typingMessage') else 'other'
-                        logger.debug("Skipping %s message (no dataMessage)", msg_type)
+                        msg_type = 'typing' if envelope.get(
+                            'typingMessage') else 'other'
+                        logger.debug(
+                            "Skipping %s message (no dataMessage)", msg_type)
                         continue
-                    
-                    # Get sender info
-                    author = (envelope.get('source') or 
-                             envelope.get('sourceNumber') or 
-                             envelope.get('sourceName'))
-                    
+
+                    group = data_message.get('groupInfo')
+
+                    is_mentioned = False
+
+                    if group:
+                        mentions = data_message.get('mentions', [])
+                        for mention in mentions:
+                            if mention.get('number') == self.signal_cfg.number:
+                                is_mentioned = True
+                        
+                        if not is_mentioned:
+                            logger.debug("Got group message without mention, skipping message")
+                            continue
+                        
+                        internal_group_id = group.get('groupId')
+                        
+                        if not internal_group_id:
+                            logger.debug("Got group message without groupId, skipping message")
+                            continue
+                        
+                        group_id = self.groups.get(internal_group_id)
+                        
+                        if not group_id:
+                            await self._get_groups()
+                            group_id = self.groups.get(internal_group_id)
+                            
+                        if not group_id:
+                            logger.debug("Couldn't get internal group id for group, skipping message")
+                            continue
+                        
+                        author = group_id
+
+                    else:
+                        # Get sender info
+                        author = (envelope.get('source') or
+                                envelope.get('sourceNumber') or
+                                envelope.get('sourceName'))
+
                     # Get message content
-                    body = (data_message.get('message') or '').strip()
-                    
+                    # Unicode U+fffc  is used as placeholder for mentions
+                    body = (data_message.get('message') or '').replace("￼ ", "").strip()
+
+                    # Insert quoted text into body
+                    quote = data_message.get('quote')
+                    if quote:
+                        quote_message = quote.get('text')
+                        if quote_message:
+                            body = f"{quote_message}\n{body}"
+                        
+
                     if not author:
                         logger.debug("Missing author, skipping message")
                         continue
-                    
+
                     # Check if this is a voice message
                     if self._is_voice_message(data_message):
                         try:
@@ -234,18 +319,19 @@ class SignalLLMBridge:
                             if handled:
                                 continue
                         except Exception as e:
-                            logger.error("Error processing voice message from %s: %s", author, e)
+                            logger.error(
+                                "Error processing voice message from %s: %s", author, e)
                             await self._send_reply(author, "Sorry, I encountered an error processing your voice message.")
                             continue
-                    
+
                     # Handle regular text messages
                     if not body:
                         logger.debug("No text content in message, skipping")
                         continue
-                        
+
                     logger.info("Received from %s: %s", author, body)
                     await self._start_typing(author)
-                    reply = await self._get_ai_response(body, author)
+                    reply = await self._get_ai_response(body, author, skip_history=bool(group))
                     await self._stop_typing(author)
                     await self._send_reply(author, reply)
 
@@ -254,7 +340,7 @@ class SignalLLMBridge:
                     logger.debug("Problematic message: %s", str(msg)[:200] if 'msg' in locals() else 'N/A')
 
             await asyncio.sleep(self.signal_cfg.poll_interval)
-            
+
         if self.session:
             await self.session.close()
 
@@ -263,7 +349,7 @@ class SignalLLMBridge:
         attachments = data_message.get('attachments', [])
         if not attachments:
             return False
-        
+
         voice_mime_types = [
             'audio/aac',
             'audio/mp4',
@@ -274,7 +360,7 @@ class SignalLLMBridge:
             'audio/3gpp',
             'audio/amr'
         ]
-        
+
         for attachment in attachments:
             content_type = attachment.get('contentType', '').lower()
             if content_type in voice_mime_types:
@@ -299,13 +385,13 @@ class SignalLLMBridge:
         """Transcribe audio using the new /asr endpoint"""
         if not self.whisper_cfg.enabled:
             return None
-        
+
         try:
             # Create temporary file for audio data
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
                 temp_file.write(audio_data)
                 temp_file_path = temp_file.name
-            
+
             try:
                 # Prepare multipart form data for /asr endpoint
                 with open(temp_file_path, 'rb') as audio_file:
@@ -353,43 +439,42 @@ class SignalLLMBridge:
     async def _process_voice_message(self, data_message: Dict[str, Any], author: str) -> bool:
         """Process voice message and send transcription. Returns True if handled."""
         attachments = data_message.get('attachments', [])
-        
+
         for attachment in attachments:
             content_type = attachment.get('contentType', '').lower()
             attachment_id = attachment.get('id')
-            
+
             if not attachment_id:
                 continue
-                
+
             voice_mime_types = [
-                'audio/aac', 'audio/mp4', 'audio/mpeg', 'audio/ogg', 
+                'audio/aac', 'audio/mp4', 'audio/mpeg', 'audio/ogg',
                 'audio/wav', 'audio/webm', 'audio/3gpp', 'audio/amr'
             ]
-            
+
             if content_type in voice_mime_types:
                 logger.info("Processing voice message from %s (type: %s)", author, content_type)
-                
+
                 # Download the audio file
                 audio_data = await self._download_attachment(attachment_id)
                 if not audio_data:
                     await self._send_reply(author, "Sorry, I couldn't download your voice message.")
                     return True
-                
+
                 # Transcribe the audio
                 filename = f"voice_message.{content_type.split('/')[-1]}"
                 transcription = await self._transcribe_audio(audio_data, filename)
-                
+
                 if transcription:
                     reply = f"Voice message transcription:\n\n{transcription}"
                     logger.info("Transcribed voice message from %s: %s", author, transcription)
                 else:
                     reply = "Sorry, I couldn't transcribe your voice message."
-                    
+
                 await self._send_reply(author, reply)
                 return True
-        
-        return False
 
+        return False
 
     async def _typing_loop(self):
         while self.typing_to is not None:
@@ -406,7 +491,7 @@ class SignalLLMBridge:
         payload = {
             'recipient': recipient
         }
-        
+
         try:
             await self.session.put(send_url, json=payload)
             logger.info("Sent typing indicator to %s", recipient)
@@ -422,7 +507,7 @@ class SignalLLMBridge:
         payload = {
             'recipient': recipient
         }
-        
+
         try:
             await self.session.delete(send_url, json=payload)
             logger.info("Removed typing indicator to %s", recipient)
@@ -438,34 +523,37 @@ class SignalLLMBridge:
             'message': message,
             'text_mode': 'styled'
         }
-        
+
         try:
             async with self.session.post(send_url, json=payload) as resp_send:
                 resp_send.raise_for_status()
                 response_data = await resp_send.json()
-                logger.info("Sent to %s (timestamp: %s)", recipient, response_data.get('timestamp', 'unknown'))
+                logger.info("Sent to %s (timestamp: %s)", recipient,
+                            response_data.get('timestamp', 'unknown'))
         except Exception as e:
             logger.error("Error sending to %s: %s", recipient, e)
 
-    async def _get_ai_response(self, prompt: str, user: str) -> str:
-        history = self.context.get_history(user)
-        
+    async def _get_ai_response(self, prompt: str, user: str, skip_history: bool) -> str:
         # Build messages in OpenAI format for LiteLLM
         messages = []
+
+        if not skip_history:
+            history = self.context.get_history(user)
+            # Add conversation history
+            for msg in history:
+                messages.append({
+                    'role': msg['role'],
+                    'content': msg['content']
+                })
+
         
-        # Add conversation history
-        for msg in history:
-            messages.append({
-                'role': msg['role'],
-                'content': msg['content']
-            })
-        
+
         # Add current user message
         messages.append({
             'role': 'user',
             'content': prompt
         })
-        
+
         try:
             # Use LiteLLM async completion
             response = await litellm.acompletion(
@@ -480,13 +568,14 @@ class SignalLLMBridge:
             
             # Filter out <think></think> content before saving and sending
             filtered_reply = filter_think_tags(reply)
-            
-            self.context.add_message(user, 'user', prompt)
-            self.context.add_message(user, 'assistant', filtered_reply)
-            
+
+            if not skip_history:
+                self.context.add_message(user, 'user', prompt)
+                self.context.add_message(user, 'assistant', filtered_reply)
+
             logger.debug("Original reply length: %d, filtered length: %d", len(reply), len(filtered_reply))
             return filtered_reply
-            
+
         except Exception as e:
             logger.error("LLM API error: %s", e)
             return "Sorry, I encountered an error processing your request."
